@@ -1,5 +1,6 @@
 import os
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -232,9 +233,81 @@ def initialize_database():
 
                 status TEXT NOT NULL DEFAULT 'PENDING',
 
+                discord_channel_id INTEGER,
+
+                discord_message_id INTEGER,
+
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
                 resolved_at TIMESTAMP
+            )
+            """
+        )
+
+        trade_proposal_columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(draft_trade_proposals)"
+            ).fetchall()
+        }
+
+        if "discord_channel_id" not in trade_proposal_columns:
+            connection.execute(
+                "ALTER TABLE draft_trade_proposals ADD COLUMN discord_channel_id INTEGER"
+            )
+
+        if "discord_message_id" not in trade_proposal_columns:
+            connection.execute(
+                "ALTER TABLE draft_trade_proposals ADD COLUMN discord_message_id INTEGER"
+            )
+
+        # -----------------------------------------------------
+        # DRAFT STATE MIGRATION
+        # -----------------------------------------------------
+
+        draft_state_columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(draft_state)"
+            ).fetchall()
+        }
+
+        if "draft_channel_id" not in draft_state_columns:
+            connection.execute(
+                "ALTER TABLE draft_state ADD COLUMN draft_channel_id INTEGER"
+            )
+
+        # -----------------------------------------------------
+        # DRAFT PICK CLOCK
+        # -----------------------------------------------------
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS draft_pick_clock (
+                overall_pick INTEGER PRIMARY KEY,
+
+                status TEXT NOT NULL DEFAULT 'WAITING',
+
+                clock_started_at TEXT,
+
+                clock_expires_at TEXT,
+
+                start_notification_sent INTEGER NOT NULL DEFAULT 0,
+
+                six_hour_reminder_sent INTEGER NOT NULL DEFAULT 0,
+
+                thirty_minute_reminder_sent INTEGER NOT NULL DEFAULT 0,
+
+                expiration_notification_sent INTEGER NOT NULL DEFAULT 0,
+
+                expired_at TEXT,
+
+                completed_at TEXT,
+
+                completed_from_status TEXT,
+
+                FOREIGN KEY (overall_pick)
+                    REFERENCES draft_pick_ownership(overall_pick)
             )
             """
         )
@@ -259,6 +332,61 @@ def initialize_database():
                 priority TEXT NOT NULL,
 
                 status TEXT NOT NULL DEFAULT 'OPEN',
+
+                discord_channel_id INTEGER,
+
+                discord_message_id INTEGER,
+
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+                updated_at TIMESTAMP
+            )
+            """
+        )
+
+        feature_request_columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(feature_requests)"
+            ).fetchall()
+        }
+
+        if "discord_channel_id" not in feature_request_columns:
+            connection.execute(
+                "ALTER TABLE feature_requests ADD COLUMN discord_channel_id INTEGER"
+            )
+
+        if "discord_message_id" not in feature_request_columns:
+            connection.execute(
+                "ALTER TABLE feature_requests ADD COLUMN discord_message_id INTEGER"
+            )
+
+        # -----------------------------------------------------
+        # BUG REPORTS
+        # -----------------------------------------------------
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bug_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                discord_user_id INTEGER NOT NULL,
+
+                discord_username TEXT NOT NULL,
+
+                subject TEXT NOT NULL,
+
+                description TEXT NOT NULL,
+
+                command_name TEXT,
+
+                priority TEXT NOT NULL,
+
+                status TEXT NOT NULL DEFAULT 'OPEN',
+
+                discord_channel_id INTEGER,
+
+                discord_message_id INTEGER,
 
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
@@ -435,12 +563,629 @@ def initialize_draft_pick_ownership():
 
 
 # =============================================================
+# DRAFT CLOCK HELPERS
+# =============================================================
+
+DRAFT_CLOCK_HOURS = 12
+
+DRAFT_CLOCK_STATUSES = {
+    "WAITING",
+    "ON_CLOCK",
+    "EXPIRED",
+    "COMPLETED",
+}
+
+
+def _utc_now():
+    return datetime.now(timezone.utc)
+
+
+def _to_utc_iso(value):
+    if value is None:
+        value = _utc_now()
+
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    else:
+        value = value.astimezone(timezone.utc)
+
+    return value.isoformat()
+
+
+def _parse_utc_timestamp(value):
+    if value is None:
+        return None
+
+    parsed = datetime.fromisoformat(value)
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+
+    return parsed.astimezone(timezone.utc)
+
+
+def _clock_window(started_at=None):
+    start = started_at or _utc_now()
+
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    else:
+        start = start.astimezone(timezone.utc)
+
+    expires = start + timedelta(hours=DRAFT_CLOCK_HOURS)
+
+    return (
+        _to_utc_iso(start),
+        _to_utc_iso(expires),
+    )
+
+
+def initialize_draft_pick_clock(
+    reset=False,
+    started_at=None,
+):
+    state = get_draft_state()
+
+    total_teams = state["total_teams"]
+    total_rounds = state["total_rounds"]
+
+    if total_teams is None or total_rounds is None:
+        return
+
+    total_picks = total_teams * total_rounds
+
+    if total_picks <= 0:
+        return
+
+    existing_picks = {
+        row["overall_pick"]
+        for row in get_all_draft_picks()
+    }
+
+    current_pick = state["current_pick"] or 1
+
+    with get_connection() as connection:
+        if reset:
+            connection.execute(
+                "DELETE FROM draft_pick_clock"
+            )
+
+        existing_count = connection.execute(
+            "SELECT COUNT(*) AS count FROM draft_pick_clock"
+        ).fetchone()["count"]
+
+        if existing_count > 0 and not reset:
+            return
+
+        for overall_pick in range(1, total_picks + 1):
+            if overall_pick in existing_picks:
+                status = "COMPLETED"
+            elif overall_pick < current_pick:
+                status = "EXPIRED"
+            elif (
+                state["active"]
+                and overall_pick == current_pick
+            ):
+                status = "ON_CLOCK"
+            else:
+                status = "WAITING"
+
+            clock_started_at = None
+            clock_expires_at = None
+
+            if status == "ON_CLOCK":
+                (
+                    clock_started_at,
+                    clock_expires_at,
+                ) = _clock_window(started_at)
+
+            connection.execute(
+                """
+                INSERT INTO draft_pick_clock (
+                    overall_pick,
+                    status,
+                    clock_started_at,
+                    clock_expires_at,
+                    expired_at,
+                    completed_at,
+                    completed_from_status
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    overall_pick,
+                    status,
+                    clock_started_at,
+                    clock_expires_at,
+                    (
+                        _to_utc_iso(started_at)
+                        if status == "EXPIRED"
+                        else None
+                    ),
+                    (
+                        _to_utc_iso(started_at)
+                        if status == "COMPLETED"
+                        else None
+                    ),
+                    None,
+                ),
+            )
+
+        connection.commit()
+
+
+def get_pick_clock(overall_pick):
+    with get_connection() as connection:
+        return connection.execute(
+            """
+            SELECT *
+            FROM draft_pick_clock
+            WHERE overall_pick = ?
+            """,
+            (overall_pick,),
+        ).fetchone()
+
+
+def get_all_pick_clocks():
+    with get_connection() as connection:
+        return connection.execute(
+            """
+            SELECT *
+            FROM draft_pick_clock
+            ORDER BY overall_pick
+            """
+        ).fetchall()
+
+
+def get_current_pick_clock():
+    state = get_draft_state()
+    current_pick = state["current_pick"]
+
+    if current_pick is None:
+        return None
+
+    return get_pick_clock(current_pick)
+
+
+def get_expired_picks_for_team(
+    espn_team_id,
+):
+    with get_connection() as connection:
+        return connection.execute(
+            """
+            SELECT
+                c.*,
+                o.round_number,
+                o.pick_in_round,
+                o.current_espn_team_id,
+                o.current_team_name,
+                o.original_espn_team_id,
+                o.original_team_name,
+                o.traded
+            FROM draft_pick_clock c
+            JOIN draft_pick_ownership o
+                ON o.overall_pick = c.overall_pick
+            WHERE
+                c.status = 'EXPIRED'
+                AND o.current_espn_team_id = ?
+            ORDER BY c.overall_pick
+            """,
+            (espn_team_id,),
+        ).fetchall()
+
+
+def get_oldest_expired_pick_for_team(
+    espn_team_id,
+):
+    picks = get_expired_picks_for_team(
+        espn_team_id
+    )
+
+    if not picks:
+        return None
+
+    return picks[0]
+
+
+def get_all_expired_picks():
+    with get_connection() as connection:
+        return connection.execute(
+            """
+            SELECT
+                c.*,
+                o.round_number,
+                o.pick_in_round,
+                o.current_espn_team_id,
+                o.current_team_name,
+                o.original_espn_team_id,
+                o.original_team_name,
+                o.traded
+            FROM draft_pick_clock c
+            JOIN draft_pick_ownership o
+                ON o.overall_pick = c.overall_pick
+            WHERE c.status = 'EXPIRED'
+            ORDER BY c.overall_pick
+            """
+        ).fetchall()
+
+
+def get_outstanding_expired_pick_count():
+    with get_connection() as connection:
+        return connection.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM draft_pick_clock
+            WHERE status = 'EXPIRED'
+            """
+        ).fetchone()["count"]
+
+
+def start_pick_clock(
+    overall_pick,
+    started_at=None,
+):
+    clock = get_pick_clock(overall_pick)
+
+    if clock is None:
+        raise ValueError(
+            f"Clock state for overall pick {overall_pick} does not exist."
+        )
+
+    if clock["status"] == "COMPLETED":
+        raise ValueError(
+            f"Overall pick {overall_pick} has already been completed."
+        )
+
+    (
+        clock_started_at,
+        clock_expires_at,
+    ) = _clock_window(started_at)
+
+    with get_connection() as connection:
+        connection.execute(
+            """
+            UPDATE draft_pick_clock
+            SET
+                status = 'ON_CLOCK',
+                clock_started_at = ?,
+                clock_expires_at = ?,
+                start_notification_sent = 0,
+                six_hour_reminder_sent = 0,
+                thirty_minute_reminder_sent = 0,
+                expiration_notification_sent = 0,
+                expired_at = NULL,
+                completed_at = NULL,
+                completed_from_status = NULL
+            WHERE overall_pick = ?
+            """,
+            (
+                clock_started_at,
+                clock_expires_at,
+                overall_pick,
+            ),
+        )
+        connection.commit()
+
+    return get_pick_clock(overall_pick)
+
+
+def mark_clock_notification_sent(
+    overall_pick,
+    notification_type,
+):
+    column_map = {
+        "START": "start_notification_sent",
+        "SIX_HOUR": "six_hour_reminder_sent",
+        "THIRTY_MINUTE": "thirty_minute_reminder_sent",
+        "EXPIRED": "expiration_notification_sent",
+    }
+
+    normalized = notification_type.upper().strip()
+    column = column_map.get(normalized)
+
+    if column is None:
+        raise ValueError(
+            "Invalid draft clock notification type."
+        )
+
+    with get_connection() as connection:
+        connection.execute(
+            f"""
+            UPDATE draft_pick_clock
+            SET {column} = 1
+            WHERE overall_pick = ?
+            """,
+            (overall_pick,),
+        )
+        connection.commit()
+
+    return get_pick_clock(overall_pick)
+
+
+def get_due_clock_notifications(
+    now=None,
+):
+    state = get_draft_state()
+
+    if not state["active"]:
+        return []
+
+    current_pick = state["current_pick"]
+
+    if current_pick is None:
+        return []
+
+    clock = get_pick_clock(current_pick)
+
+    if clock is None or clock["status"] != "ON_CLOCK":
+        return []
+
+    now_utc = now or _utc_now()
+
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    else:
+        now_utc = now_utc.astimezone(timezone.utc)
+
+    started_at = _parse_utc_timestamp(
+        clock["clock_started_at"]
+    )
+    expires_at = _parse_utc_timestamp(
+        clock["clock_expires_at"]
+    )
+
+    if started_at is None or expires_at is None:
+        return []
+
+    remaining = expires_at - now_utc
+
+    # Only return the most relevant event. This prevents a bot that
+    # was offline for several hours from sending multiple stale
+    # reminders at once when it reconnects.
+    if remaining <= timedelta(0):
+        return ["EXPIRED"]
+
+    if remaining <= timedelta(minutes=30):
+        if not clock["thirty_minute_reminder_sent"]:
+            return ["THIRTY_MINUTE"]
+        return []
+
+    if remaining <= timedelta(hours=6):
+        if not clock["six_hour_reminder_sent"]:
+            return ["SIX_HOUR"]
+        return []
+
+    if not clock["start_notification_sent"]:
+        return ["START"]
+
+    return []
+
+
+def get_unnotified_expired_picks():
+    with get_connection() as connection:
+        return connection.execute(
+            """
+            SELECT
+                c.*,
+                o.round_number,
+                o.pick_in_round,
+                o.current_espn_team_id,
+                o.current_team_name,
+                o.original_espn_team_id,
+                o.original_team_name,
+                o.traded
+            FROM draft_pick_clock c
+            JOIN draft_pick_ownership o
+                ON o.overall_pick = c.overall_pick
+            WHERE
+                c.status = 'EXPIRED'
+                AND c.expiration_notification_sent = 0
+            ORDER BY c.overall_pick
+            """
+        ).fetchall()
+
+
+def expire_current_pick_and_advance(
+    now=None,
+):
+    now_utc = now or _utc_now()
+
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    else:
+        now_utc = now_utc.astimezone(timezone.utc)
+
+    state = get_draft_state()
+
+    if not state["active"]:
+        return None
+
+    current_pick = state["current_pick"]
+    total_teams = state["total_teams"]
+    total_rounds = state["total_rounds"]
+
+    if (
+        current_pick is None
+        or total_teams is None
+        or total_rounds is None
+    ):
+        return None
+
+    total_picks = total_teams * total_rounds
+
+    if current_pick > total_picks:
+        return None
+
+    clock = get_pick_clock(current_pick)
+
+    if clock is None or clock["status"] != "ON_CLOCK":
+        return None
+
+    expires_at = _parse_utc_timestamp(
+        clock["clock_expires_at"]
+    )
+
+    if expires_at is None or now_utc < expires_at:
+        return None
+
+    next_pick = current_pick + 1
+    next_clock = None
+
+    with get_connection() as connection:
+        connection.execute(
+            """
+            UPDATE draft_pick_clock
+            SET
+                status = 'EXPIRED',
+                expired_at = ?,
+                completed_at = NULL,
+                completed_from_status = NULL
+            WHERE
+                overall_pick = ?
+                AND status = 'ON_CLOCK'
+            """,
+            (
+                _to_utc_iso(now_utc),
+                current_pick,
+            ),
+        )
+
+        if next_pick <= total_picks:
+            (
+                next_started_at,
+                next_expires_at,
+            ) = _clock_window(now_utc)
+
+            connection.execute(
+                """
+                UPDATE draft_pick_clock
+                SET
+                    status = 'ON_CLOCK',
+                    clock_started_at = ?,
+                    clock_expires_at = ?,
+                    start_notification_sent = 0,
+                    six_hour_reminder_sent = 0,
+                    thirty_minute_reminder_sent = 0,
+                    expiration_notification_sent = 0,
+                    expired_at = NULL,
+                    completed_at = NULL,
+                    completed_from_status = NULL
+                WHERE overall_pick = ?
+                """,
+                (
+                    next_started_at,
+                    next_expires_at,
+                    next_pick,
+                ),
+            )
+
+            connection.execute(
+                """
+                UPDATE draft_state
+                SET current_pick = ?
+                WHERE id = 1
+                """,
+                (next_pick,),
+            )
+
+        else:
+            connection.execute(
+                """
+                UPDATE draft_state
+                SET current_pick = ?
+                WHERE id = 1
+                """,
+                (next_pick,),
+            )
+
+        connection.commit()
+
+    if next_pick <= total_picks:
+        next_clock = get_pick_clock(next_pick)
+
+    return {
+        "expired_pick": current_pick,
+        "expired_owner": get_pick_owner(current_pick),
+        "next_pick": (
+            next_pick
+            if next_pick <= total_picks
+            else None
+        ),
+        "next_clock": next_clock,
+    }
+
+
+def _complete_clock_pick(
+    connection,
+    overall_pick,
+    previous_status,
+    completed_at=None,
+):
+    connection.execute(
+        """
+        UPDATE draft_pick_clock
+        SET
+            status = 'COMPLETED',
+            completed_at = ?,
+            completed_from_status = ?
+        WHERE overall_pick = ?
+        """,
+        (
+            _to_utc_iso(completed_at),
+            previous_status,
+            overall_pick,
+        ),
+    )
+
+
+def _start_next_scheduled_pick(
+    connection,
+    next_pick,
+    total_picks,
+    started_at=None,
+):
+    if next_pick > total_picks:
+        return False
+
+    (
+        clock_started_at,
+        clock_expires_at,
+    ) = _clock_window(started_at)
+
+    connection.execute(
+        """
+        UPDATE draft_pick_clock
+        SET
+            status = 'ON_CLOCK',
+            clock_started_at = ?,
+            clock_expires_at = ?,
+            start_notification_sent = 0,
+            six_hour_reminder_sent = 0,
+            thirty_minute_reminder_sent = 0,
+            expiration_notification_sent = 0,
+            expired_at = NULL,
+            completed_at = NULL,
+            completed_from_status = NULL
+        WHERE overall_pick = ?
+        """,
+        (
+            clock_started_at,
+            clock_expires_at,
+            next_pick,
+        ),
+    )
+
+    return True
+
+
+# =============================================================
 # START NEW DRAFT
 # =============================================================
 
 def start_new_draft(
     draft_order,
     total_rounds,
+    draft_channel_id=None,
 ):
     total_teams = len(
         draft_order
@@ -449,33 +1194,27 @@ def start_new_draft(
     with get_connection() as connection:
 
         connection.execute(
-            """
-            DELETE FROM draft_picks
-            """
+            "DELETE FROM draft_picks"
         )
 
         connection.execute(
-            """
-            DELETE FROM draft_order
-            """
+            "DELETE FROM draft_order"
         )
 
         connection.execute(
-            """
-            DELETE FROM draft_pick_ownership
-            """
+            "DELETE FROM draft_pick_ownership"
         )
 
         connection.execute(
-            """
-            DELETE FROM draft_pick_trades
-            """
+            "DELETE FROM draft_pick_clock"
         )
 
         connection.execute(
-            """
-            DELETE FROM draft_trade_proposals
-            """
+            "DELETE FROM draft_pick_trades"
+        )
+
+        connection.execute(
+            "DELETE FROM draft_trade_proposals"
         )
 
         for draft_position, team in enumerate(
@@ -493,12 +1232,8 @@ def start_new_draft(
                 """,
                 (
                     draft_position,
-                    team[
-                        "espn_team_id"
-                    ],
-                    team[
-                        "team_name"
-                    ],
+                    team["espn_team_id"],
+                    team["team_name"],
                 ),
             )
 
@@ -510,6 +1245,7 @@ def start_new_draft(
                 current_pick = 1,
                 total_teams = ?,
                 total_rounds = ?,
+                draft_channel_id = ?,
                 draftboard_channel_id = NULL,
                 draftboard_message_id = NULL
             WHERE id = 1
@@ -517,12 +1253,16 @@ def start_new_draft(
             (
                 total_teams,
                 total_rounds,
+                draft_channel_id,
             ),
         )
 
         connection.commit()
 
     initialize_draft_pick_ownership()
+    initialize_draft_pick_clock(
+        reset=True
+    )
 
 
 # =============================================================
@@ -672,50 +1412,121 @@ def save_draft_pick(
     position,
     nfl_team,
     discord_user_id,
+    target_overall_pick=None,
 ):
-    current = (
-        get_current_draft_team()
+    state = get_draft_state()
+
+    if not state["active"]:
+        raise ValueError(
+            "There is no active draft."
+        )
+
+    current_pick = state["current_pick"]
+    total_teams = state["total_teams"]
+    total_rounds = state["total_rounds"]
+
+    if total_teams is None or total_rounds is None:
+        raise ValueError(
+            "Draft configuration is incomplete."
+        )
+
+    total_picks = total_teams * total_rounds
+
+    if target_overall_pick is None:
+        target_overall_pick = current_pick
+
+    if (
+        target_overall_pick is None
+        or target_overall_pick < 1
+        or target_overall_pick > total_picks
+    ):
+        raise ValueError(
+            "There is no valid draft pick to complete."
+        )
+
+    ownership = get_pick_owner(
+        target_overall_pick
     )
 
-    if current is None:
+    if ownership is None:
         raise ValueError(
-            "There is no active draft pick."
+            "Draft pick ownership could not be found."
         )
 
-    team = current[
-        "team"
-    ]
+    clock = get_pick_clock(
+        target_overall_pick
+    )
 
-    overall_pick = current[
-        "overall_pick"
-    ]
+    if clock is None:
+        raise ValueError(
+            "Draft clock state could not be found."
+        )
 
-    round_number = current[
-        "round_number"
-    ]
+    previous_clock_status = clock["status"]
 
-    pick_in_round = current[
-        "pick_in_round"
-    ]
+    if previous_clock_status not in {
+        "ON_CLOCK",
+        "EXPIRED",
+    }:
+        if previous_clock_status == "COMPLETED":
+            raise ValueError(
+                "That draft pick has already been completed."
+            )
+
+        raise ValueError(
+            "That draft pick is not currently eligible to be made."
+        )
+
+    if (
+        previous_clock_status == "ON_CLOCK"
+        and target_overall_pick != current_pick
+    ):
+        raise ValueError(
+            "That pick is not the current scheduled pick."
+        )
+
+    overall_pick = target_overall_pick
+    round_number = ownership["round_number"]
+    pick_in_round = ownership["pick_in_round"]
+
+    team = {
+        "espn_team_id": ownership[
+            "current_espn_team_id"
+        ],
+        "team_name": ownership[
+            "current_team_name"
+        ],
+    }
+
+    now_utc = _utc_now()
 
     with get_connection() as connection:
-
-        existing_player = (
-            connection.execute(
-                """
-                SELECT *
-                FROM draft_picks
-                WHERE espn_player_id = ?
-                """,
-                (
-                    espn_player_id,
-                ),
-            ).fetchone()
-        )
+        existing_player = connection.execute(
+            """
+            SELECT *
+            FROM draft_picks
+            WHERE espn_player_id = ?
+            """,
+            (espn_player_id,),
+        ).fetchone()
 
         if existing_player is not None:
             raise ValueError(
                 "That player has already been drafted."
+            )
+
+        existing_pick = connection.execute(
+            """
+            SELECT *
+            FROM draft_picks
+            WHERE overall_pick = ?
+            """,
+            (overall_pick,),
+        ).fetchone()
+
+        if existing_pick is not None:
+            raise ValueError(
+                "That draft pick has already been completed."
             )
 
         connection.execute(
@@ -724,133 +1535,95 @@ def save_draft_pick(
                 overall_pick,
                 round_number,
                 pick_in_round,
-
                 espn_team_id,
                 team_name,
-
                 espn_player_id,
                 player_name,
-
                 position,
                 nfl_team,
-
                 discord_user_id
             )
-            VALUES (
-                ?,
-                ?,
-                ?,
-                ?,
-                ?,
-                ?,
-                ?,
-                ?,
-                ?,
-                ?
-            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 overall_pick,
                 round_number,
                 pick_in_round,
-
-                team[
-                    "espn_team_id"
-                ],
-
-                team[
-                    "team_name"
-                ],
-
+                team["espn_team_id"],
+                team["team_name"],
                 espn_player_id,
                 player_name,
-
                 position,
                 nfl_team,
-
                 discord_user_id,
             ),
         )
 
-        state = connection.execute(
-            """
-            SELECT *
-            FROM draft_state
-            WHERE id = 1
-            """
-        ).fetchone()
-
-        total_picks = (
-            state[
-                "total_teams"
-            ]
-            * state[
-                "total_rounds"
-            ]
+        _complete_clock_pick(
+            connection,
+            overall_pick,
+            previous_clock_status,
+            now_utc,
         )
 
-        next_pick = (
-            overall_pick
-            + 1
-        )
+        if previous_clock_status == "ON_CLOCK":
+            next_pick = overall_pick + 1
 
-        if (
-            overall_pick
-            >= total_picks
-        ):
+            if next_pick <= total_picks:
+                _start_next_scheduled_pick(
+                    connection,
+                    next_pick,
+                    total_picks,
+                    now_utc,
+                )
+
+                connection.execute(
+                    """
+                    UPDATE draft_state
+                    SET current_pick = ?
+                    WHERE id = 1
+                    """,
+                    (next_pick,),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE draft_state
+                    SET current_pick = ?
+                    WHERE id = 1
+                    """,
+                    (next_pick,),
+                )
+
+        remaining_incomplete = connection.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM draft_pick_clock
+            WHERE status != 'COMPLETED'
+            """
+        ).fetchone()["count"]
+
+        if remaining_incomplete == 0:
             connection.execute(
                 """
                 UPDATE draft_state
-                SET
-                    current_pick = ?,
-                    active = 0
+                SET active = 0
                 WHERE id = 1
-                """,
-                (
-                    next_pick,
-                ),
-            )
-
-        else:
-            connection.execute(
                 """
-                UPDATE draft_state
-                SET current_pick = ?
-                WHERE id = 1
-                """,
-                (
-                    next_pick,
-                ),
             )
 
         connection.commit()
 
     return {
-        "overall_pick": (
-            overall_pick
+        "overall_pick": overall_pick,
+        "round_number": round_number,
+        "pick_in_round": pick_in_round,
+        "team": team,
+        "traded": bool(ownership["traded"]),
+        "catch_up": (
+            previous_clock_status == "EXPIRED"
         ),
-
-        "round_number": (
-            round_number
-        ),
-
-        "pick_in_round": (
-            pick_in_round
-        ),
-
-        "team": {
-            "espn_team_id": team[
-                "espn_team_id"
-            ],
-
-            "team_name": team[
-                "team_name"
-            ],
-        },
-
-        "traded": current[
-            "traded"
-        ],
+        "previous_clock_status": previous_clock_status,
     }
 
 
@@ -892,7 +1665,9 @@ def get_last_draft_pick():
             """
             SELECT *
             FROM draft_picks
-            ORDER BY overall_pick DESC
+            ORDER BY
+                datetime(picked_at) DESC,
+                rowid DESC
             LIMIT 1
             """
         ).fetchone()
@@ -903,41 +1678,132 @@ def get_last_draft_pick():
 # =============================================================
 
 def undo_last_draft_pick():
-    last_pick = (
-        get_last_draft_pick()
-    )
+    last_pick = get_last_draft_pick()
 
     if last_pick is None:
         return None
 
-    with get_connection() as connection:
+    overall_pick = last_pick["overall_pick"]
+    clock = get_pick_clock(overall_pick)
 
+    completed_from_status = (
+        clock["completed_from_status"]
+        if clock is not None
+        else None
+    )
+
+    state = get_draft_state()
+    current_pick = state["current_pick"]
+    total_teams = state["total_teams"]
+    total_rounds = state["total_rounds"]
+
+    total_picks = (
+        total_teams * total_rounds
+        if total_teams is not None
+        and total_rounds is not None
+        else 0
+    )
+
+    now_utc = _utc_now()
+
+    with get_connection() as connection:
         connection.execute(
             """
             DELETE FROM draft_picks
             WHERE overall_pick = ?
             """,
-            (
-                last_pick[
-                    "overall_pick"
-                ],
-            ),
+            (overall_pick,),
         )
 
-        connection.execute(
-            """
-            UPDATE draft_state
-            SET
-                current_pick = ?,
-                active = 1
-            WHERE id = 1
-            """,
-            (
-                last_pick[
-                    "overall_pick"
-                ],
-            ),
+        should_rewind_clock = (
+            completed_from_status == "ON_CLOCK"
+            and current_pick == overall_pick + 1
+            and current_pick <= total_picks
         )
+
+        if should_rewind_clock:
+            connection.execute(
+                """
+                UPDATE draft_pick_clock
+                SET
+                    status = 'WAITING',
+                    clock_started_at = NULL,
+                    clock_expires_at = NULL,
+                    start_notification_sent = 0,
+                    six_hour_reminder_sent = 0,
+                    thirty_minute_reminder_sent = 0,
+                    expiration_notification_sent = 0,
+                    expired_at = NULL,
+                    completed_at = NULL,
+                    completed_from_status = NULL
+                WHERE overall_pick = ?
+                """,
+                (current_pick,),
+            )
+
+            (
+                started_at,
+                expires_at,
+            ) = _clock_window(now_utc)
+
+            connection.execute(
+                """
+                UPDATE draft_pick_clock
+                SET
+                    status = 'ON_CLOCK',
+                    clock_started_at = ?,
+                    clock_expires_at = ?,
+                    start_notification_sent = 0,
+                    six_hour_reminder_sent = 0,
+                    thirty_minute_reminder_sent = 0,
+                    expiration_notification_sent = 0,
+                    expired_at = NULL,
+                    completed_at = NULL,
+                    completed_from_status = NULL
+                WHERE overall_pick = ?
+                """,
+                (
+                    started_at,
+                    expires_at,
+                    overall_pick,
+                ),
+            )
+
+            connection.execute(
+                """
+                UPDATE draft_state
+                SET
+                    current_pick = ?,
+                    active = 1
+                WHERE id = 1
+                """,
+                (overall_pick,),
+            )
+
+        else:
+            connection.execute(
+                """
+                UPDATE draft_pick_clock
+                SET
+                    status = 'EXPIRED',
+                    expired_at = ?,
+                    completed_at = NULL,
+                    completed_from_status = NULL
+                WHERE overall_pick = ?
+                """,
+                (
+                    _to_utc_iso(now_utc),
+                    overall_pick,
+                ),
+            )
+
+            connection.execute(
+                """
+                UPDATE draft_state
+                SET active = 1
+                WHERE id = 1
+                """
+            )
 
         connection.commit()
 
@@ -967,6 +1833,21 @@ def save_draftboard_message(
             ),
         )
 
+        connection.commit()
+
+
+def save_draft_channel(
+    channel_id,
+):
+    with get_connection() as connection:
+        connection.execute(
+            """
+            UPDATE draft_state
+            SET draft_channel_id = ?
+            WHERE id = 1
+            """,
+            (channel_id,),
+        )
         connection.commit()
 
 
@@ -1785,6 +2666,50 @@ def create_trade_proposal(
         return cursor.lastrowid
 
 
+def save_trade_proposal_message(
+    proposal_id,
+    discord_channel_id,
+    discord_message_id,
+):
+    with get_connection() as connection:
+        existing = connection.execute(
+            """
+            SELECT id
+            FROM draft_trade_proposals
+            WHERE id = ?
+            """,
+            (
+                proposal_id,
+            ),
+        ).fetchone()
+
+        if existing is None:
+            raise ValueError(
+                f"Trade proposal #{proposal_id} does not exist."
+            )
+
+        connection.execute(
+            """
+            UPDATE draft_trade_proposals
+            SET
+                discord_channel_id = ?,
+                discord_message_id = ?
+            WHERE id = ?
+            """,
+            (
+                discord_channel_id,
+                discord_message_id,
+                proposal_id,
+            ),
+        )
+
+        connection.commit()
+
+    return get_trade_proposal(
+        proposal_id
+    )
+
+
 def get_trade_proposal(
     proposal_id,
 ):
@@ -2199,6 +3124,22 @@ def invalidate_pending_trade_proposals_for_picks(
 # FEATURE REQUESTS
 # =============================================================
 
+FEATURE_REQUEST_STATUSES = {
+    "OPEN",
+    "PLANNED",
+    "IN_PROGRESS",
+    "COMPLETED",
+    "DECLINED",
+}
+
+FEEDBACK_PRIORITIES = {
+    "P1",
+    "P2",
+    "P3",
+    "P4",
+}
+
+
 def create_feature_request(
     discord_user_id,
     discord_username,
@@ -2206,25 +3147,11 @@ def create_feature_request(
     description,
     priority,
 ):
-    allowed_priorities = {
-        "P1",
-        "P2",
-        "P3",
-        "P4",
-    }
+    priority = priority.upper().strip()
 
-    priority = (
-        priority
-        .upper()
-        .strip()
-    )
-
-    if priority not in allowed_priorities:
+    if priority not in FEEDBACK_PRIORITIES:
         raise ValueError(
-            (
-                "Priority must be one of: "
-                "P1, P2, P3, or P4."
-            )
+            "Priority must be one of: P1, P2, P3, or P4."
         )
 
     subject = subject.strip()
@@ -2241,7 +3168,6 @@ def create_feature_request(
         )
 
     with get_connection() as connection:
-
         cursor = connection.execute(
             """
             INSERT INTO feature_requests (
@@ -2252,14 +3178,7 @@ def create_feature_request(
                 priority,
                 status
             )
-            VALUES (
-                ?,
-                ?,
-                ?,
-                ?,
-                ?,
-                'OPEN'
-            )
+            VALUES (?, ?, ?, ?, ?, 'OPEN')
             """,
             (
                 discord_user_id,
@@ -2269,31 +3188,53 @@ def create_feature_request(
                 priority,
             ),
         )
-
         connection.commit()
+        feature_request_id = cursor.lastrowid
 
-        feature_request_id = (
-            cursor.lastrowid
-        )
-
-    return get_feature_request(
-        feature_request_id
-    )
+    return get_feature_request(feature_request_id)
 
 
-def get_feature_request(
+def save_feature_request_message(
     feature_request_id,
+    discord_channel_id,
+    discord_message_id,
 ):
     with get_connection() as connection:
-        return connection.execute(
+        existing = connection.execute(
+            "SELECT id FROM feature_requests WHERE id = ?",
+            (feature_request_id,),
+        ).fetchone()
+
+        if existing is None:
+            raise ValueError(
+                f"Feature request #{feature_request_id} does not exist."
+            )
+
+        connection.execute(
             """
-            SELECT *
-            FROM feature_requests
+            UPDATE feature_requests
+            SET
+                discord_channel_id = ?,
+                discord_message_id = ?,
+                updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
             (
+                discord_channel_id,
+                discord_message_id,
                 feature_request_id,
             ),
+        )
+        connection.commit()
+
+    return get_feature_request(feature_request_id)
+
+
+def get_feature_request(feature_request_id):
+    with get_connection() as connection:
+        return connection.execute(
+            "SELECT * FROM feature_requests WHERE id = ?",
+            (feature_request_id,),
         ).fetchone()
 
 
@@ -2308,24 +3249,10 @@ def get_all_feature_requests():
         ).fetchall()
 
 
-def get_feature_requests_by_status(
-    status,
-):
-    allowed_statuses = {
-        "OPEN",
-        "PLANNED",
-        "IN_PROGRESS",
-        "COMPLETED",
-        "DECLINED",
-    }
+def get_feature_requests_by_status(status):
+    status = status.upper().strip()
 
-    status = (
-        status
-        .upper()
-        .strip()
-    )
-
-    if status not in allowed_statuses:
+    if status not in FEATURE_REQUEST_STATUSES:
         raise ValueError(
             "Invalid feature request status."
         )
@@ -2338,9 +3265,7 @@ def get_feature_requests_by_status(
             WHERE status = ?
             ORDER BY id DESC
             """,
-            (
-                status,
-            ),
+            (status,),
         ).fetchall()
 
 
@@ -2348,48 +3273,25 @@ def update_feature_request_status(
     feature_request_id,
     status,
 ):
-    allowed_statuses = {
-        "OPEN",
-        "PLANNED",
-        "IN_PROGRESS",
-        "COMPLETED",
-        "DECLINED",
-    }
+    status = status.upper().strip()
 
-    status = (
-        status
-        .upper()
-        .strip()
-    )
-
-    if status not in allowed_statuses:
+    if status not in FEATURE_REQUEST_STATUSES:
         raise ValueError(
             (
-                "Feature request status must be "
-                "OPEN, PLANNED, IN_PROGRESS, "
-                "COMPLETED, or DECLINED."
+                "Feature request status must be OPEN, PLANNED, "
+                "IN_PROGRESS, COMPLETED, or DECLINED."
             )
         )
 
     with get_connection() as connection:
-
         existing = connection.execute(
-            """
-            SELECT *
-            FROM feature_requests
-            WHERE id = ?
-            """,
-            (
-                feature_request_id,
-            ),
+            "SELECT id FROM feature_requests WHERE id = ?",
+            (feature_request_id,),
         ).fetchone()
 
         if existing is None:
             raise ValueError(
-                (
-                    f"Feature request "
-                    f"#{feature_request_id} does not exist."
-                )
+                f"Feature request #{feature_request_id} does not exist."
             )
 
         connection.execute(
@@ -2400,17 +3302,200 @@ def update_feature_request_status(
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
-            (
-                status,
-                feature_request_id,
-            ),
+            (status, feature_request_id),
         )
-
         connection.commit()
 
-    return get_feature_request(
-        feature_request_id
-    )
+    return get_feature_request(feature_request_id)
+
+
+# =============================================================
+# BUG REPORTS
+# =============================================================
+
+BUG_REPORT_STATUSES = {
+    "OPEN",
+    "INVESTIGATING",
+    "IN_PROGRESS",
+    "FIXED",
+    "CLOSED",
+    "WONT_FIX",
+}
+
+
+def create_bug_report(
+    discord_user_id,
+    discord_username,
+    subject,
+    description,
+    priority,
+    command=None,
+):
+    priority = priority.upper().strip()
+
+    if priority not in FEEDBACK_PRIORITIES:
+        raise ValueError(
+            "Priority must be one of: P1, P2, P3, or P4."
+        )
+
+    subject = subject.strip()
+    description = description.strip()
+
+    if command is not None:
+        command = command.strip() or None
+
+    if not subject:
+        raise ValueError(
+            "Bug report subject cannot be empty."
+        )
+
+    if not description:
+        raise ValueError(
+            "Bug report description cannot be empty."
+        )
+
+    with get_connection() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO bug_reports (
+                discord_user_id,
+                discord_username,
+                subject,
+                description,
+                command_name,
+                priority,
+                status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 'OPEN')
+            """,
+            (
+                discord_user_id,
+                discord_username,
+                subject,
+                description,
+                command,
+                priority,
+            ),
+        )
+        connection.commit()
+        bug_report_id = cursor.lastrowid
+
+    return get_bug_report(bug_report_id)
+
+
+def save_bug_report_message(
+    bug_report_id,
+    discord_channel_id,
+    discord_message_id,
+):
+    with get_connection() as connection:
+        existing = connection.execute(
+            "SELECT id FROM bug_reports WHERE id = ?",
+            (bug_report_id,),
+        ).fetchone()
+
+        if existing is None:
+            raise ValueError(
+                f"Bug report #{bug_report_id} does not exist."
+            )
+
+        connection.execute(
+            """
+            UPDATE bug_reports
+            SET
+                discord_channel_id = ?,
+                discord_message_id = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                discord_channel_id,
+                discord_message_id,
+                bug_report_id,
+            ),
+        )
+        connection.commit()
+
+    return get_bug_report(bug_report_id)
+
+
+def get_bug_report(bug_report_id):
+    with get_connection() as connection:
+        return connection.execute(
+            "SELECT *, command_name AS command FROM bug_reports WHERE id = ?",
+            (bug_report_id,),
+        ).fetchone()
+
+
+def get_all_bug_reports():
+    with get_connection() as connection:
+        return connection.execute(
+            """
+            SELECT *, command_name AS command
+            FROM bug_reports
+            ORDER BY id DESC
+            """
+        ).fetchall()
+
+
+def get_bug_reports_by_status(status):
+    status = status.upper().strip()
+
+    if status not in BUG_REPORT_STATUSES:
+        raise ValueError(
+            "Invalid bug report status."
+        )
+
+    with get_connection() as connection:
+        return connection.execute(
+            """
+            SELECT *, command_name AS command
+            FROM bug_reports
+            WHERE status = ?
+            ORDER BY id DESC
+            """,
+            (status,),
+        ).fetchall()
+
+
+def update_bug_report_status(
+    bug_report_id,
+    status,
+):
+    status = status.upper().strip()
+
+    if status not in BUG_REPORT_STATUSES:
+        raise ValueError(
+            (
+                "Bug report status must be OPEN, INVESTIGATING, "
+                "IN_PROGRESS, FIXED, CLOSED, or WONT_FIX."
+            )
+        )
+
+    with get_connection() as connection:
+        existing = connection.execute(
+            "SELECT id FROM bug_reports WHERE id = ?",
+            (bug_report_id,),
+        ).fetchone()
+
+        if existing is None:
+            raise ValueError(
+                f"Bug report #{bug_report_id} does not exist."
+            )
+
+        connection.execute(
+            """
+            UPDATE bug_reports
+            SET
+                status = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (status, bug_report_id),
+        )
+        connection.commit()
+
+    return get_bug_report(bug_report_id)
 
 
 # =============================================================

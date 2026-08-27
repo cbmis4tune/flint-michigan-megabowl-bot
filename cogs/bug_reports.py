@@ -5,18 +5,14 @@ from discord import app_commands
 from discord.ext import commands
 
 from database.database import (
-    create_feature_request,
-    get_all_feature_requests,
-    get_feature_request,
-    get_feature_requests_by_status,
-    save_feature_request_message,
-    update_feature_request_status,
+    create_bug_report,
+    get_all_bug_reports,
+    get_bug_report,
+    get_bug_reports_by_status,
+    save_bug_report_message,
+    update_bug_report_status,
 )
 
-
-# =============================================================
-# CONFIG
-# =============================================================
 
 FEEDBACK_CHANNEL_ENV_VAR = "FEEDBACK_CHANNEL_ID"
 
@@ -26,55 +22,47 @@ ADMIN_ROLES = {
 }
 
 
-# =============================================================
-# PRIORITY DEFINITIONS
-# =============================================================
-
-PRIORITY_DEFINITIONS = {
-    "P1": "Critical — major functionality is broken or blocked.",
-    "P2": "High — important improvement with significant impact.",
-    "P3": "Normal — useful improvement or enhancement.",
-    "P4": "Low — nice-to-have or minor quality-of-life improvement.",
+BUG_SEVERITY_DEFINITIONS = {
+    "P1": "Critical — bot or major functionality is unusable.",
+    "P2": "High — a major feature is broken, but the bot remains usable.",
+    "P3": "Normal — limited impact or a workaround exists.",
+    "P4": "Low — minor issue, visual problem, typo, or small defect.",
 }
 
 
-# =============================================================
-# FEATURE REQUEST STATUS DEFINITIONS
-# =============================================================
-
-FEATURE_REQUEST_STATUSES = {
-    "OPEN": "🟢 OPEN",
-    "PLANNED": "🟡 PLANNED",
+BUG_REPORT_STATUSES = {
+    "OPEN": "🔴 OPEN",
+    "INVESTIGATING": "🔎 INVESTIGATING",
     "IN_PROGRESS": "🔵 IN PROGRESS",
-    "COMPLETED": "✅ COMPLETED",
-    "DECLINED": "❌ DECLINED",
+    "FIXED": "✅ FIXED",
+    "CLOSED": "⚪ CLOSED",
+    "WONT_FIX": "❌ WON'T FIX",
 }
 
 
-# =============================================================
-# FEATURE REQUEST MODAL
-# =============================================================
-
-class FeatureRequestModal(discord.ui.Modal):
+class BugReportModal(discord.ui.Modal):
     def __init__(
         self,
-        feature_request_cog,
+        bug_report_cog,
     ):
         super().__init__(
-            title="Submit Feature Request",
+            title="Submit Bug Report",
             timeout=300,
         )
 
-        self.feature_request_cog = (
-            feature_request_cog
-        )
+        self.bug_report_cog = bug_report_cog
 
         self.subject = discord.ui.TextInput(
             label="Subject",
-            placeholder=(
-                "Short summary of the request"
-            ),
+            placeholder="Short summary of the problem",
             required=True,
+            max_length=100,
+        )
+
+        self.command = discord.ui.TextInput(
+            label="Command",
+            placeholder="Example: /roster (optional)",
+            required=False,
             max_length=100,
         )
 
@@ -82,35 +70,28 @@ class FeatureRequestModal(discord.ui.Modal):
             label="Description",
             style=discord.TextStyle.paragraph,
             placeholder=(
-                "Describe what you would like "
-                "the bot to do and why it would "
-                "be useful."
+                "Describe what happened, what you expected "
+                "to happen, and anything that may help "
+                "reproduce the issue."
             ),
             required=True,
             max_length=1500,
         )
 
         self.priority = discord.ui.TextInput(
-            label="Priority",
+            label="Severity",
             placeholder=(
                 "P1 Critical | P2 High | "
-                "P3 Normal | P4 Nice-to-have"
+                "P3 Normal | P4 Low"
             ),
             required=True,
             max_length=2,
         )
 
-        self.add_item(
-            self.subject
-        )
-
-        self.add_item(
-            self.description
-        )
-
-        self.add_item(
-            self.priority
-        )
+        self.add_item(self.subject)
+        self.add_item(self.command)
+        self.add_item(self.description)
+        self.add_item(self.priority)
 
     async def on_submit(
         self,
@@ -127,27 +108,23 @@ class FeatureRequestModal(discord.ui.Modal):
                 .strip()
             )
 
-            if (
-                priority
-                not in PRIORITY_DEFINITIONS
-            ):
+            if priority not in BUG_SEVERITY_DEFINITIONS:
                 await interaction.followup.send(
                     (
-                        "❌ Invalid priority.\n\n"
+                        "❌ Invalid severity.\n\n"
                         "**P1** — Critical\n"
                         "**P2** — High\n"
                         "**P3** — Normal\n"
-                        "**P4** — Nice-to-have\n\n"
-                        "Please run `/feature-request` "
-                        "again and enter one of those "
-                        "priority values."
+                        "**P4** — Low\n\n"
+                        "Please run `/bug-report` again "
+                        "and enter one of those values."
                     ),
                     ephemeral=True,
                 )
                 return
 
             feedback_channel = (
-                await self.feature_request_cog
+                await self.bug_report_cog
                 .get_feedback_channel()
             )
 
@@ -157,7 +134,7 @@ class FeatureRequestModal(discord.ui.Modal):
             ):
                 await interaction.followup.send(
                     (
-                        "❌ Feature requests can only "
+                        "❌ Bug reports can only "
                         f"be submitted in "
                         f"{feedback_channel.mention}."
                     ),
@@ -165,33 +142,38 @@ class FeatureRequestModal(discord.ui.Modal):
                 )
                 return
 
-            request = (
-                create_feature_request(
-                    discord_user_id=(
-                        interaction.user.id
-                    ),
-                    discord_username=(
-                        str(
-                            interaction.user
-                        )
-                    ),
-                    subject=(
-                        self.subject.value
-                    ),
-                    description=(
-                        self.description.value
-                    ),
-                    priority=(
-                        priority
-                    ),
-                )
+            command_value = (
+                self.command.value.strip()
+                if self.command.value
+                else None
+            )
+
+            report = create_bug_report(
+                discord_user_id=(
+                    interaction.user.id
+                ),
+                discord_username=(
+                    str(interaction.user)
+                ),
+                subject=(
+                    self.subject.value
+                ),
+                description=(
+                    self.description.value
+                ),
+                priority=(
+                    priority
+                ),
+                command=(
+                    command_value
+                ),
             )
 
             embed = (
-                self.feature_request_cog
-                .build_feature_request_embed(
-                    request,
-                    submitter_mention=(
+                self.bug_report_cog
+                .build_bug_report_embed(
+                    report,
+                    reporter_mention=(
                         interaction.user.mention
                     ),
                 )
@@ -203,9 +185,9 @@ class FeatureRequestModal(discord.ui.Modal):
                 )
             )
 
-            save_feature_request_message(
-                feature_request_id=(
-                    request["id"]
+            save_bug_report_message(
+                bug_report_id=(
+                    report["id"]
                 ),
                 discord_channel_id=(
                     message.channel.id
@@ -217,8 +199,8 @@ class FeatureRequestModal(discord.ui.Modal):
 
             await interaction.followup.send(
                 (
-                    "✅ Feature Request "
-                    f"**#{request['id']}** "
+                    "✅ Bug Report "
+                    f"**#{report['id']}** "
                     "was submitted successfully."
                 ),
                 ephemeral=True,
@@ -227,7 +209,7 @@ class FeatureRequestModal(discord.ui.Modal):
         except Exception as error:
             print(
                 (
-                    "Feature Request Submit Error: "
+                    "Bug Report Submit Error: "
                     f"{error}"
                 )
             )
@@ -235,26 +217,18 @@ class FeatureRequestModal(discord.ui.Modal):
             await interaction.followup.send(
                 (
                     "Something went wrong while "
-                    "submitting the feature request."
+                    "submitting the bug report."
                 ),
                 ephemeral=True,
             )
 
 
-# =============================================================
-# FEATURE REQUEST COG
-# =============================================================
-
-class FeatureRequestCog(commands.Cog):
+class BugReportCog(commands.Cog):
     def __init__(
         self,
         bot,
     ):
         self.bot = bot
-
-    # =========================================================
-    # PERMISSIONS
-    # =========================================================
 
     def has_feedback_admin_role(
         self,
@@ -268,18 +242,13 @@ class FeatureRequestCog(commands.Cog):
 
         user_roles = {
             role.name
-            for role
-            in interaction.user.roles
+            for role in interaction.user.roles
         }
 
         return bool(
             ADMIN_ROLES
             & user_roles
         )
-
-    # =========================================================
-    # FEEDBACK CHANNEL
-    # =========================================================
 
     async def get_feedback_channel(
         self,
@@ -297,9 +266,7 @@ class FeatureRequestCog(commands.Cog):
             )
 
         try:
-            channel_id = int(
-                channel_id
-            )
+            channel_id = int(channel_id)
 
         except ValueError:
             raise ValueError(
@@ -323,34 +290,30 @@ class FeatureRequestCog(commands.Cog):
 
         return channel
 
-    # =========================================================
-    # EMBED BUILDER
-    # =========================================================
-
-    def build_feature_request_embed(
+    def build_bug_report_embed(
         self,
-        request,
-        submitter_mention=None,
+        report,
+        reporter_mention=None,
     ):
-        priority = request[
+        priority = report[
             "priority"
         ]
 
-        status = request[
+        status = report[
             "status"
         ]
 
         embed = discord.Embed(
             title=(
-                f"💡 Feature Request "
-                f"#{request['id']}"
+                f"🐛 Bug Report "
+                f"#{report['id']}"
             ),
         )
 
         embed.add_field(
             name="Subject",
             value=(
-                request[
+                report[
                     "subject"
                 ]
             ),
@@ -358,10 +321,24 @@ class FeatureRequestCog(commands.Cog):
         )
 
         embed.add_field(
-            name="Priority",
+            name="Severity",
             value=(
                 f"**{priority}**\n"
-                f"{PRIORITY_DEFINITIONS.get(priority, '')}"
+                f"{BUG_SEVERITY_DEFINITIONS.get(priority, '')}"
+            ),
+            inline=False,
+        )
+
+        command_value = (
+            report["command"]
+            if report["command"]
+            else "Not specified"
+        )
+
+        embed.add_field(
+            name="Command",
+            value=(
+                command_value
             ),
             inline=False,
         )
@@ -369,7 +346,7 @@ class FeatureRequestCog(commands.Cog):
         embed.add_field(
             name="Description",
             value=(
-                request[
+                report[
                     "description"
                 ]
             ),
@@ -379,7 +356,7 @@ class FeatureRequestCog(commands.Cog):
         embed.add_field(
             name="Status",
             value=(
-                FEATURE_REQUEST_STATUSES.get(
+                BUG_REPORT_STATUSES.get(
                     status,
                     status,
                 )
@@ -387,27 +364,27 @@ class FeatureRequestCog(commands.Cog):
             inline=True,
         )
 
-        if submitter_mention is None:
-            submitter_mention = (
-                f"<@{request['discord_user_id']}>"
+        if reporter_mention is None:
+            reporter_mention = (
+                f"<@{report['discord_user_id']}>"
             )
 
         embed.add_field(
-            name="Submitted By",
+            name="Reported By",
             value=(
-                submitter_mention
+                reporter_mention
             ),
             inline=True,
         )
 
-        if request[
+        if report[
             "updated_at"
         ]:
             embed.add_field(
                 name="Last Updated",
                 value=(
                     str(
-                        request[
+                        report[
                             "updated_at"
                         ]
                     )
@@ -418,25 +395,21 @@ class FeatureRequestCog(commands.Cog):
         embed.set_footer(
             text=(
                 "Flint Michigan Megabowl "
-                "Feature Request"
+                "Bug Report"
             )
         )
 
         return embed
 
-    # =========================================================
-    # EDIT ORIGINAL PUBLIC MESSAGE
-    # =========================================================
-
-    async def refresh_feature_request_message(
+    async def refresh_bug_report_message(
         self,
-        request,
+        report,
     ):
-        channel_id = request[
+        channel_id = report[
             "discord_channel_id"
         ]
 
-        message_id = request[
+        message_id = report[
             "discord_message_id"
         ]
 
@@ -465,8 +438,8 @@ class FeatureRequestCog(commands.Cog):
             )
 
             embed = (
-                self.build_feature_request_embed(
-                    request
+                self.build_bug_report_embed(
+                    report
                 )
             )
 
@@ -479,8 +452,8 @@ class FeatureRequestCog(commands.Cog):
         except discord.NotFound:
             print(
                 (
-                    "Feature request public message "
-                    f"#{request['id']} no longer exists."
+                    "Bug report public message "
+                    f"#{report['id']} no longer exists."
                 )
             )
 
@@ -489,25 +462,21 @@ class FeatureRequestCog(commands.Cog):
         except Exception as error:
             print(
                 (
-                    "Feature Request Message Refresh Error: "
+                    "Bug Report Message Refresh Error: "
                     f"{error}"
                 )
             )
 
             return False
 
-    # =========================================================
-    # FEATURE REQUEST COMMAND
-    # =========================================================
-
     @app_commands.command(
-        name="feature-request",
+        name="bug-report",
         description=(
-            "Submit a feature request "
+            "Submit a bug report "
             "for the Megabowl bot."
         ),
     )
-    async def feature_request(
+    async def bug_report(
         self,
         interaction: discord.Interaction,
     ):
@@ -522,7 +491,7 @@ class FeatureRequestCog(commands.Cog):
             ):
                 await interaction.response.send_message(
                     (
-                        "❌ `/feature-request` can only "
+                        "❌ `/bug-report` can only "
                         f"be used in "
                         f"{feedback_channel.mention}."
                     ),
@@ -530,8 +499,8 @@ class FeatureRequestCog(commands.Cog):
                 )
                 return
 
-            modal = FeatureRequestModal(
-                feature_request_cog=self,
+            modal = BugReportModal(
+                bug_report_cog=self,
             )
 
             await interaction.response.send_modal(
@@ -541,7 +510,7 @@ class FeatureRequestCog(commands.Cog):
         except Exception as error:
             print(
                 (
-                    "Feature Request Command Error: "
+                    "Bug Report Command Error: "
                     f"{error}"
                 )
             )
@@ -553,7 +522,7 @@ class FeatureRequestCog(commands.Cog):
                 await interaction.followup.send(
                     (
                         "Something went wrong while "
-                        "opening the feature request form."
+                        "opening the bug report form."
                     ),
                     ephemeral=True,
                 )
@@ -562,19 +531,15 @@ class FeatureRequestCog(commands.Cog):
                 await interaction.response.send_message(
                     (
                         "Something went wrong while "
-                        "opening the feature request form."
+                        "opening the bug report form."
                     ),
                     ephemeral=True,
                 )
 
-    # =========================================================
-    # ADMIN — LIST FEATURE REQUESTS
-    # =========================================================
-
     @app_commands.command(
-        name="feature-requests",
+        name="bug-reports",
         description=(
-            "Admin: list feature requests."
+            "Admin: list bug reports."
         ),
     )
     @app_commands.describe(
@@ -589,24 +554,28 @@ class FeatureRequestCog(commands.Cog):
                 value="OPEN",
             ),
             app_commands.Choice(
-                name="Planned",
-                value="PLANNED",
+                name="Investigating",
+                value="INVESTIGATING",
             ),
             app_commands.Choice(
                 name="In Progress",
                 value="IN_PROGRESS",
             ),
             app_commands.Choice(
-                name="Completed",
-                value="COMPLETED",
+                name="Fixed",
+                value="FIXED",
             ),
             app_commands.Choice(
-                name="Declined",
-                value="DECLINED",
+                name="Closed",
+                value="CLOSED",
+            ),
+            app_commands.Choice(
+                name="Won't Fix",
+                value="WONT_FIX",
             ),
         ]
     )
-    async def feature_requests(
+    async def bug_reports(
         self,
         interaction: discord.Interaction,
         status: (
@@ -627,38 +596,36 @@ class FeatureRequestCog(commands.Cog):
                         "❌ Only members with the "
                         "**Commissioner** or "
                         "**Developer** role can "
-                        "view feature requests."
+                        "view bug reports."
                     ),
                     ephemeral=True,
                 )
                 return
 
             if status is None:
-                requests = (
-                    get_all_feature_requests()
+                reports = (
+                    get_all_bug_reports()
                 )
 
-                title = (
-                    "💡 Feature Requests"
-                )
+                title = "🐛 Bug Reports"
 
             else:
-                requests = (
-                    get_feature_requests_by_status(
+                reports = (
+                    get_bug_reports_by_status(
                         status.value
                     )
                 )
 
                 title = (
-                    "💡 Feature Requests — "
+                    "🐛 Bug Reports — "
                     f"{status.name}"
                 )
 
-            if not requests:
+            if not reports:
                 await interaction.followup.send(
                     (
-                        "No matching feature "
-                        "requests were found."
+                        "No matching bug reports "
+                        "were found."
                     ),
                     ephemeral=True,
                 )
@@ -670,13 +637,21 @@ class FeatureRequestCog(commands.Cog):
 
             lines = []
 
-            for request in requests[:25]:
+            for report in reports[:25]:
+                command_text = (
+                    f" • {report['command']}"
+                    if report["command"]
+                    else ""
+                )
+
                 lines.append(
                     (
-                        f"**#{request['id']}** "
-                        f"[{request['priority']}] "
-                        f"{request['subject']}\n"
-                        f"↳ {FEATURE_REQUEST_STATUSES.get(request['status'], request['status'])}"
+                        f"**#{report['id']}** "
+                        f"[{report['priority']}] "
+                        f"{report['subject']}"
+                        f"{command_text}\n"
+                        f"↳ "
+                        f"{BUG_REPORT_STATUSES.get(report['status'], report['status'])}"
                     )
                 )
 
@@ -686,14 +661,11 @@ class FeatureRequestCog(commands.Cog):
                 )
             )
 
-            if (
-                len(requests)
-                > 25
-            ):
+            if len(reports) > 25:
                 embed.set_footer(
                     text=(
                         f"Showing 25 of "
-                        f"{len(requests)} requests."
+                        f"{len(reports)} reports."
                     )
                 )
 
@@ -705,7 +677,7 @@ class FeatureRequestCog(commands.Cog):
         except Exception as error:
             print(
                 (
-                    "Feature Requests List Error: "
+                    "Bug Reports List Error: "
                     f"{error}"
                 )
             )
@@ -713,30 +685,26 @@ class FeatureRequestCog(commands.Cog):
             await interaction.followup.send(
                 (
                     "Something went wrong while "
-                    "retrieving feature requests."
+                    "retrieving bug reports."
                 ),
                 ephemeral=True,
             )
 
-    # =========================================================
-    # ADMIN — VIEW FEATURE REQUEST
-    # =========================================================
-
     @app_commands.command(
-        name="feature-request-view",
+        name="bug-report-view",
         description=(
-            "Admin: view a feature request."
+            "Admin: view a bug report."
         ),
     )
     @app_commands.describe(
-        request_id=(
-            "Feature request number."
+        report_id=(
+            "Bug report number."
         )
     )
-    async def feature_request_view(
+    async def bug_report_view(
         self,
         interaction: discord.Interaction,
-        request_id: app_commands.Range[
+        report_id: app_commands.Range[
             int,
             1,
             1000000,
@@ -755,23 +723,23 @@ class FeatureRequestCog(commands.Cog):
                         "❌ Only members with the "
                         "**Commissioner** or "
                         "**Developer** role can "
-                        "view feature request details."
+                        "view bug report details."
                     ),
                     ephemeral=True,
                 )
                 return
 
-            request = (
-                get_feature_request(
-                    request_id
+            report = (
+                get_bug_report(
+                    report_id
                 )
             )
 
-            if request is None:
+            if report is None:
                 await interaction.followup.send(
                     (
-                        f"❌ Feature Request "
-                        f"**#{request_id}** "
+                        f"❌ Bug Report "
+                        f"**#{report_id}** "
                         "does not exist."
                     ),
                     ephemeral=True,
@@ -779,15 +747,15 @@ class FeatureRequestCog(commands.Cog):
                 return
 
             embed = (
-                self.build_feature_request_embed(
-                    request
+                self.build_bug_report_embed(
+                    report
                 )
             )
 
             embed.add_field(
                 name="Discord User ID",
                 value=str(
-                    request[
+                    report[
                         "discord_user_id"
                     ]
                 ),
@@ -797,7 +765,7 @@ class FeatureRequestCog(commands.Cog):
             embed.add_field(
                 name="Created At",
                 value=str(
-                    request[
+                    report[
                         "created_at"
                     ]
                 ),
@@ -812,7 +780,7 @@ class FeatureRequestCog(commands.Cog):
         except Exception as error:
             print(
                 (
-                    "Feature Request View Error: "
+                    "Bug Report View Error: "
                     f"{error}"
                 )
             )
@@ -820,27 +788,23 @@ class FeatureRequestCog(commands.Cog):
             await interaction.followup.send(
                 (
                     "Something went wrong while "
-                    "retrieving that feature request."
+                    "retrieving that bug report."
                 ),
                 ephemeral=True,
             )
 
-    # =========================================================
-    # ADMIN — UPDATE FEATURE REQUEST STATUS
-    # =========================================================
-
     @app_commands.command(
-        name="feature-request-status",
+        name="bug-report-status",
         description=(
-            "Admin: change a feature request status."
+            "Admin: change a bug report status."
         ),
     )
     @app_commands.describe(
-        request_id=(
-            "Feature request number."
+        report_id=(
+            "Bug report number."
         ),
         status=(
-            "New feature request status."
+            "New bug report status."
         ),
     )
     @app_commands.choices(
@@ -850,27 +814,31 @@ class FeatureRequestCog(commands.Cog):
                 value="OPEN",
             ),
             app_commands.Choice(
-                name="Planned",
-                value="PLANNED",
+                name="Investigating",
+                value="INVESTIGATING",
             ),
             app_commands.Choice(
                 name="In Progress",
                 value="IN_PROGRESS",
             ),
             app_commands.Choice(
-                name="Completed",
-                value="COMPLETED",
+                name="Fixed",
+                value="FIXED",
             ),
             app_commands.Choice(
-                name="Declined",
-                value="DECLINED",
+                name="Closed",
+                value="CLOSED",
+            ),
+            app_commands.Choice(
+                name="Won't Fix",
+                value="WONT_FIX",
             ),
         ]
     )
-    async def feature_request_status(
+    async def bug_report_status(
         self,
         interaction: discord.Interaction,
-        request_id: app_commands.Range[
+        report_id: app_commands.Range[
             int,
             1,
             1000000,
@@ -890,16 +858,16 @@ class FeatureRequestCog(commands.Cog):
                         "❌ Only members with the "
                         "**Commissioner** or "
                         "**Developer** role can "
-                        "change feature request statuses."
+                        "change bug report statuses."
                     ),
                     ephemeral=True,
                 )
                 return
 
-            request = (
-                update_feature_request_status(
-                    feature_request_id=(
-                        request_id
+            report = (
+                update_bug_report_status(
+                    bug_report_id=(
+                        report_id
                     ),
                     status=(
                         status.value
@@ -908,13 +876,13 @@ class FeatureRequestCog(commands.Cog):
             )
 
             public_message_updated = (
-                await self.refresh_feature_request_message(
-                    request
+                await self.refresh_bug_report_message(
+                    report
                 )
             )
 
             message_status = (
-                "The public request post was updated."
+                "The public bug report post was updated."
                 if public_message_updated
                 else (
                     "The database was updated, but "
@@ -925,8 +893,8 @@ class FeatureRequestCog(commands.Cog):
 
             await interaction.followup.send(
                 (
-                    f"✅ Feature Request "
-                    f"**#{request_id}** is now "
+                    f"✅ Bug Report "
+                    f"**#{report_id}** is now "
                     f"**{status.name}**.\n\n"
                     f"{message_status}"
                 ),
@@ -935,16 +903,14 @@ class FeatureRequestCog(commands.Cog):
 
         except ValueError as error:
             await interaction.followup.send(
-                (
-                    f"❌ {error}"
-                ),
+                f"❌ {error}",
                 ephemeral=True,
             )
 
         except Exception as error:
             print(
                 (
-                    "Feature Request Status Error: "
+                    "Bug Report Status Error: "
                     f"{error}"
                 )
             )
@@ -952,21 +918,17 @@ class FeatureRequestCog(commands.Cog):
             await interaction.followup.send(
                 (
                     "Something went wrong while "
-                    "updating that feature request."
+                    "updating that bug report."
                 ),
                 ephemeral=True,
             )
 
 
-# =============================================================
-# COG SETUP
-# =============================================================
-
 async def setup(
     bot,
 ):
     await bot.add_cog(
-        FeatureRequestCog(
+        BugReportCog(
             bot
         )
     )
