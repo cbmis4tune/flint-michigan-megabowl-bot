@@ -2775,9 +2775,20 @@ class DraftCog(commands.Cog):
                     and overall_pick
                     == current_pick
                 ):
+                    deadline = (
+                        self.format_clock_deadline(
+                            clock
+                        )
+                    )
+
                     status = (
                         "⏰ **ON THE CLOCK**"
                     )
+
+                    if deadline:
+                        status += (
+                            f"\n↳ Expires {deadline}"
+                        )
 
                 else:
                     status = "—"
@@ -2800,6 +2811,82 @@ class DraftCog(commands.Cog):
                 ),
                 inline=False,
             )
+
+        outstanding_catch_up_lines = []
+
+        for clock in sorted(
+            clock_rows,
+            key=lambda row: row["overall_pick"],
+        ):
+            if clock["status"] != "EXPIRED":
+                continue
+
+            overall_pick = clock[
+                "overall_pick"
+            ]
+            ownership = (
+                ownership_by_pick.get(
+                    overall_pick
+                )
+            )
+
+            if ownership is None:
+                continue
+
+            outstanding_catch_up_lines.append(
+                (
+                    f"`{overall_pick:>3}` "
+                    f"**{ownership['current_team_name']}** "
+                    f"— Round {ownership['round_number']} "
+                    f"Pick {ownership['pick_in_round']}"
+                )
+            )
+
+        if outstanding_catch_up_lines:
+            chunks = []
+            current_chunk = []
+            current_length = 0
+
+            for line in outstanding_catch_up_lines:
+                added_length = len(line) + 1
+
+                if (
+                    current_chunk
+                    and current_length + added_length
+                    > 950
+                ):
+                    chunks.append(
+                        "\n".join(
+                            current_chunk
+                        )
+                    )
+                    current_chunk = []
+                    current_length = 0
+
+                current_chunk.append(line)
+                current_length += added_length
+
+            if current_chunk:
+                chunks.append(
+                    "\n".join(
+                        current_chunk
+                    )
+                )
+
+            for index, chunk in enumerate(
+                chunks
+            ):
+                field_name = (
+                    "⌛ Outstanding Catch-Up Picks"
+                    if index == 0
+                    else "⌛ Catch-Up Picks (cont.)"
+                )
+
+                embed.add_field(
+                    name=field_name,
+                    value=chunk,
+                    inline=False,
+                )
 
         return embed
 
@@ -4707,25 +4794,30 @@ class DraftCog(commands.Cog):
                 get_current_draft_team()
             )
 
-            if current is None:
-                await interaction.followup.send(
-                    (
-                        "❌ There is no active "
-                        "draft pick."
-                    ),
-                    ephemeral=True,
-                )
-                return
-
-            target_overall_pick = (
-                current["overall_pick"]
-            )
+            target_overall_pick = None
             catch_up_pick = None
 
-            if not self.has_draft_admin_role(
+            if self.has_draft_admin_role(
                 interaction
             ):
+                if current is None:
+                    await interaction.followup.send(
+                        (
+                            "❌ There is no scheduled "
+                            "draft pick currently on the clock. "
+                            "Any remaining selections are "
+                            "catch-up picks and must be made "
+                            "by the team owner."
+                        ),
+                        ephemeral=True,
+                    )
+                    return
 
+                target_overall_pick = (
+                    current["overall_pick"]
+                )
+
+            else:
                 claim = (
                     get_team_claim_by_user(
                         interaction.user.id
@@ -4744,23 +4836,46 @@ class DraftCog(commands.Cog):
                     )
                     return
 
-                current_team_id = (
-                    current["team"][
-                        "espn_team_id"
-                    ]
+                # Catch-up picks always take priority for the
+                # team's owner. This keeps overdue selections
+                # oldest-first even if the team's next scheduled
+                # pick has already come back around.
+                catch_up_pick = (
+                    get_oldest_expired_pick_for_team(
+                        claim["espn_team_id"]
+                    )
                 )
 
-                if (
-                    claim["espn_team_id"]
-                    != current_team_id
-                ):
-                    catch_up_pick = (
-                        get_oldest_expired_pick_for_team(
-                            claim["espn_team_id"]
-                        )
+                if catch_up_pick is not None:
+                    target_overall_pick = (
+                        catch_up_pick[
+                            "overall_pick"
+                        ]
                     )
 
-                    if catch_up_pick is None:
+                else:
+                    if current is None:
+                        await interaction.followup.send(
+                            (
+                                "❌ There is no scheduled pick "
+                                "currently on the clock, and "
+                                "your team does not have an "
+                                "outstanding catch-up pick."
+                            ),
+                            ephemeral=True,
+                        )
+                        return
+
+                    current_team_id = (
+                        current["team"][
+                            "espn_team_id"
+                        ]
+                    )
+
+                    if (
+                        claim["espn_team_id"]
+                        != current_team_id
+                    ):
                         await interaction.followup.send(
                             (
                                 "❌ It is not your turn "
@@ -4773,9 +4888,7 @@ class DraftCog(commands.Cog):
                         return
 
                     target_overall_pick = (
-                        catch_up_pick[
-                            "overall_pick"
-                        ]
+                        current["overall_pick"]
                     )
 
             try:
@@ -4942,30 +5055,43 @@ class DraftCog(commands.Cog):
                     get_current_draft_team()
                 )
 
-                next_marker = (
-                    " 🔄"
-                    if next_pick[
-                        "traded"
-                    ]
-                    else ""
-                )
+                if next_pick is not None:
+                    next_marker = (
+                        " 🔄"
+                        if next_pick[
+                            "traded"
+                        ]
+                        else ""
+                    )
 
-                embed.add_field(
-                    name="⏰ On the Clock",
-                    value=(
-                        f"**"
-                        f"{next_pick['team']['team_name']}"
-                        f"{next_marker}"
-                        f"**\n"
-                        f"Round "
-                        f"{next_pick['round_number']} "
-                        f"• Pick "
-                        f"{next_pick['pick_in_round']} "
-                        f"• Overall "
-                        f"{next_pick['overall_pick']}"
-                    ),
-                    inline=False,
-                )
+                    embed.add_field(
+                        name="⏰ On the Clock",
+                        value=(
+                            f"**"
+                            f"{next_pick['team']['team_name']}"
+                            f"{next_marker}"
+                            f"**\n"
+                            f"Round "
+                            f"{next_pick['round_number']} "
+                            f"• Pick "
+                            f"{next_pick['pick_in_round']} "
+                            f"• Overall "
+                            f"{next_pick['overall_pick']}"
+                        ),
+                        inline=False,
+                    )
+
+                else:
+                    embed.add_field(
+                        name="⌛ Catch-Up Picks Remaining",
+                        value=(
+                            "All scheduled draft clocks have "
+                            "finished. The draft will complete "
+                            "after all outstanding catch-up "
+                            "picks are made."
+                        ),
+                        inline=False,
+                    )
 
             await interaction.followup.send(
                 embed=embed
