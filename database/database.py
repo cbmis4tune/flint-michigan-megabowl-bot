@@ -1,3 +1,4 @@
+import os
 import sqlite3
 from pathlib import Path
 
@@ -7,7 +8,10 @@ from pathlib import Path
 # =============================================================
 
 DATABASE_PATH = Path(
-    "megabowl.db"
+    os.getenv(
+        "DATABASE_PATH",
+        "megabowl.db",
+    )
 )
 
 
