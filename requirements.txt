@@ -1,0 +1,5 @@
+espn-api
+python-dotenv
+discord.py
+tzdata
+openpyxl

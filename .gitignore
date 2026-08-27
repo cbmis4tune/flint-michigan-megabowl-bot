@@ -1,0 +1,25 @@
+# Environment / secrets
+.env
+
+# Virtual environment
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local database
+*.db
+*.sqlite
+*.sqlite3
+
+# Generated exports
+exports/
+
+# VS Code
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
