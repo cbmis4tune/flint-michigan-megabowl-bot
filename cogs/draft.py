@@ -2,10 +2,11 @@ import csv
 import json
 import os
 from pathlib import Path
+from datetime import datetime, timezone
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from openpyxl import Workbook
 from openpyxl.styles import Font
 
@@ -18,24 +19,34 @@ from database.database import (
     create_trade_proposal,
     decline_trade_proposal,
     end_draft,
+    expire_current_pick_and_advance,
     get_all_draft_picks,
+    get_all_pick_clocks,
+    get_all_expired_picks,
     get_all_pick_ownership,
     get_all_pick_trades,
     get_all_team_claims,
     get_current_draft_team,
+    get_current_pick_clock,
     get_drafted_player_ids,
+    get_due_clock_notifications,
     get_draft_order,
     get_draft_state,
     get_pending_trade_proposals,
     get_pending_trade_proposals_for_user,
     get_pick_owner,
+    get_oldest_expired_pick_for_team,
+    get_outstanding_expired_pick_count,
     get_team_claim_by_team,
     get_team_claim_by_user,
     get_trade_proposal,
     invalidate_pending_trade_proposals_for_picks,
+    mark_clock_notification_sent,
     remove_team_claim,
+    save_draft_channel,
     save_draft_pick,
     save_draftboard_message,
+    save_trade_proposal_message,
     start_new_draft,
     trade_draft_picks,
     undo_last_draft_pick,
@@ -506,6 +517,10 @@ class DraftOrderModal(discord.ui.Modal):
                 self.total_rounds,
             )
 
+            save_draft_channel(
+                interaction.channel.id
+            )
+
             order_text = ""
 
             for position, team in enumerate(
@@ -557,6 +572,8 @@ class DraftOrderModal(discord.ui.Modal):
             draftboard_message = (
                 await self.draft_cog.create_draftboard_message()
             )
+
+            await self.draft_cog.process_draft_clock()
 
             await interaction.followup.send(
                 (
@@ -681,6 +698,12 @@ class DraftCog(commands.Cog):
         bot,
     ):
         self.bot = bot
+        self.draft_clock_loop.start()
+
+    def cog_unload(
+        self,
+    ):
+        self.draft_clock_loop.cancel()
 
     async def cog_load(
         self,
@@ -722,6 +745,285 @@ class DraftCog(commands.Cog):
                     f"{error}"
                 )
             )
+
+    # =========================================================
+    # DRAFT CLOCK
+    # =========================================================
+
+    def _parse_clock_timestamp(
+        self,
+        value,
+    ):
+        if not value:
+            return None
+
+        parsed = datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        )
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(
+                tzinfo=timezone.utc
+            )
+
+        return parsed.astimezone(
+            timezone.utc
+        )
+
+    async def get_draft_channel(
+        self,
+    ):
+        state = get_draft_state()
+        channel_id = state[
+            "draft_channel_id"
+        ]
+
+        if not channel_id:
+            return None
+
+        channel = self.bot.get_channel(
+            channel_id
+        )
+
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(
+                    channel_id
+                )
+            except discord.DiscordException:
+                return None
+
+        return channel
+
+    def get_pick_owner_mention(
+        self,
+        ownership,
+    ):
+        if ownership is None:
+            return None
+
+        claim = get_team_claim_by_team(
+            ownership[
+                "current_espn_team_id"
+            ]
+        )
+
+        if claim is None:
+            return None
+
+        return (
+            f"<@{claim['discord_user_id']}>"
+        )
+
+    def format_clock_deadline(
+        self,
+        clock,
+    ):
+        if clock is None:
+            return None
+
+        expires_at = self._parse_clock_timestamp(
+            clock["clock_expires_at"]
+        )
+
+        if expires_at is None:
+            return None
+
+        timestamp = int(
+            expires_at.timestamp()
+        )
+
+        return (
+            f"<t:{timestamp}:F> "
+            f"(<t:{timestamp}:R>)"
+        )
+
+    async def send_clock_notification(
+        self,
+        notification_type,
+        ownership,
+        clock,
+    ):
+        channel = await self.get_draft_channel()
+
+        if channel is None or ownership is None:
+            return False
+
+        mention = self.get_pick_owner_mention(
+            ownership
+        )
+
+        addressee = (
+            mention
+            if mention
+            else f"**{ownership['current_team_name']}**"
+        )
+
+        pick_text = (
+            f"Round {ownership['round_number']} • "
+            f"Pick {ownership['pick_in_round']} • "
+            f"Overall {ownership['overall_pick']}"
+        )
+
+        deadline = self.format_clock_deadline(
+            clock
+        )
+
+        if notification_type == "START":
+            message = (
+                f"⏰ {addressee} is **ON THE CLOCK**.\n"
+                f"{pick_text}\n"
+                f"You have **12 hours** to make the pick."
+            )
+
+            if deadline:
+                message += (
+                    f"\nClock expires {deadline}."
+                )
+
+        elif notification_type == "SIX_HOUR":
+            message = (
+                f"⏳ {addressee} — **6 hours remain** "
+                f"on your draft clock.\n{pick_text}"
+            )
+
+            if deadline:
+                message += (
+                    f"\nClock expires {deadline}."
+                )
+
+        elif notification_type == "THIRTY_MINUTE":
+            message = (
+                f"🚨 {addressee} — **30 minutes remain** "
+                f"on your draft clock.\n{pick_text}"
+            )
+
+            if deadline:
+                message += (
+                    f"\nClock expires {deadline}."
+                )
+
+        else:
+            return False
+
+        await channel.send(
+            message
+        )
+
+        return True
+
+    async def process_draft_clock(
+        self,
+    ):
+        state = get_draft_state()
+
+        if not state["active"]:
+            return
+
+        due = get_due_clock_notifications()
+
+        if not due:
+            return
+
+        notification_type = due[0]
+        current_clock = get_current_pick_clock()
+
+        if current_clock is None:
+            return
+
+        overall_pick = current_clock[
+            "overall_pick"
+        ]
+        ownership = get_pick_owner(
+            overall_pick
+        )
+
+        if notification_type == "EXPIRED":
+            result = expire_current_pick_and_advance()
+
+            if result is None:
+                return
+
+            channel = await self.get_draft_channel()
+            expired_owner = result[
+                "expired_owner"
+            ]
+
+            if channel is not None and expired_owner is not None:
+                mention = self.get_pick_owner_mention(
+                    expired_owner
+                )
+                addressee = (
+                    mention
+                    if mention
+                    else f"**{expired_owner['current_team_name']}**"
+                )
+
+                await channel.send(
+                    (
+                        f"⌛ {addressee}'s clock expired for "
+                        f"**Overall Pick {result['expired_pick']}**.\n"
+                        "That pick is now a **catch-up pick** and "
+                        "may be made at any time. The draft clock "
+                        "has advanced to the next scheduled pick."
+                    )
+                )
+
+            mark_clock_notification_sent(
+                result["expired_pick"],
+                "EXPIRED",
+            )
+
+            await self.refresh_draftboard()
+
+            if result["next_pick"] is not None:
+                next_owner = get_pick_owner(
+                    result["next_pick"]
+                )
+                next_clock = result[
+                    "next_clock"
+                ]
+
+                if await self.send_clock_notification(
+                    "START",
+                    next_owner,
+                    next_clock,
+                ):
+                    mark_clock_notification_sent(
+                        result["next_pick"],
+                        "START",
+                    )
+
+            return
+
+        if await self.send_clock_notification(
+            notification_type,
+            ownership,
+            current_clock,
+        ):
+            mark_clock_notification_sent(
+                overall_pick,
+                notification_type,
+            )
+
+    @tasks.loop(
+        seconds=30
+    )
+    async def draft_clock_loop(
+        self,
+    ):
+        try:
+            await self.process_draft_clock()
+        except Exception as error:
+            print(
+                f"Draft Clock Error: {error}"
+            )
+
+    @draft_clock_loop.before_loop
+    async def before_draft_clock_loop(
+        self,
+    ):
+        await self.bot.wait_until_ready()
 
     # =========================================================
     # ROLE / PERMISSION HELPERS
@@ -2316,6 +2618,10 @@ class DraftCog(commands.Cog):
             get_all_pick_ownership()
         )
 
+        clock_rows = (
+            get_all_pick_clocks()
+        )
+
         total_teams = state[
             "total_teams"
         ]
@@ -2347,6 +2653,11 @@ class DraftCog(commands.Cog):
         picks_by_number = {
             pick["overall_pick"]: pick
             for pick in draft_picks
+        }
+
+        clocks_by_number = {
+            clock["overall_pick"]: clock
+            for clock in clock_rows
         }
 
         current_round = (
@@ -2381,7 +2692,8 @@ class DraftCog(commands.Cog):
                 f"Showing Rounds "
                 f"{first_round}-"
                 f"{current_round}\n"
-                "🔄 = Traded Pick"
+                "🔄 = Traded Pick • "
+                "⌛ = Catch-up Pick Owed"
             ),
         )
 
@@ -2436,6 +2748,12 @@ class DraftCog(commands.Cog):
                     )
                 )
 
+                clock = (
+                    clocks_by_number.get(
+                        overall_pick
+                    )
+                )
+
                 if pick is not None:
                     status = (
                         f"**{pick['player_name']}** "
@@ -2444,13 +2762,33 @@ class DraftCog(commands.Cog):
                     )
 
                 elif (
+                    clock is not None
+                    and clock["status"]
+                    == "EXPIRED"
+                ):
+                    status = (
+                        "⌛ **EXPIRED / PICK OWED**"
+                    )
+
+                elif (
                     state["active"]
                     and overall_pick
                     == current_pick
                 ):
+                    deadline = (
+                        self.format_clock_deadline(
+                            clock
+                        )
+                    )
+
                     status = (
                         "⏰ **ON THE CLOCK**"
                     )
+
+                    if deadline:
+                        status += (
+                            f"\n↳ Expires {deadline}"
+                        )
 
                 else:
                     status = "—"
@@ -2473,6 +2811,82 @@ class DraftCog(commands.Cog):
                 ),
                 inline=False,
             )
+
+        outstanding_catch_up_lines = []
+
+        for clock in sorted(
+            clock_rows,
+            key=lambda row: row["overall_pick"],
+        ):
+            if clock["status"] != "EXPIRED":
+                continue
+
+            overall_pick = clock[
+                "overall_pick"
+            ]
+            ownership = (
+                ownership_by_pick.get(
+                    overall_pick
+                )
+            )
+
+            if ownership is None:
+                continue
+
+            outstanding_catch_up_lines.append(
+                (
+                    f"`{overall_pick:>3}` "
+                    f"**{ownership['current_team_name']}** "
+                    f"— Round {ownership['round_number']} "
+                    f"Pick {ownership['pick_in_round']}"
+                )
+            )
+
+        if outstanding_catch_up_lines:
+            chunks = []
+            current_chunk = []
+            current_length = 0
+
+            for line in outstanding_catch_up_lines:
+                added_length = len(line) + 1
+
+                if (
+                    current_chunk
+                    and current_length + added_length
+                    > 950
+                ):
+                    chunks.append(
+                        "\n".join(
+                            current_chunk
+                        )
+                    )
+                    current_chunk = []
+                    current_length = 0
+
+                current_chunk.append(line)
+                current_length += added_length
+
+            if current_chunk:
+                chunks.append(
+                    "\n".join(
+                        current_chunk
+                    )
+                )
+
+            for index, chunk in enumerate(
+                chunks
+            ):
+                field_name = (
+                    "⌛ Outstanding Catch-Up Picks"
+                    if index == 0
+                    else "⌛ Catch-Up Picks (cont.)"
+                )
+
+                embed.add_field(
+                    name=field_name,
+                    value=chunk,
+                    inline=False,
+                )
 
         return embed
 
@@ -3057,14 +3471,29 @@ class DraftCog(commands.Cog):
                 )
             )
 
-            await interaction.followup.send(
-                content=(
-                    f"<@"
-                    f"{recipient_claim['discord_user_id']}"
-                    f">"
+            proposal_message = (
+                await interaction.followup.send(
+                    content=(
+                        f"<@"
+                        f"{recipient_claim['discord_user_id']}"
+                        f">"
+                    ),
+                    embed=embed,
+                    view=view,
+                    wait=True,
+                )
+            )
+
+            save_trade_proposal_message(
+                proposal_id=(
+                    proposal_id
                 ),
-                embed=embed,
-                view=view,
+                discord_channel_id=(
+                    proposal_message.channel.id
+                ),
+                discord_message_id=(
+                    proposal_message.id
+                ),
             )
 
         except ValueError as error:
@@ -3307,6 +3736,180 @@ class DraftCog(commands.Cog):
             )
 
     # =========================================================
+    # UPDATE CANCELLED TRADE MESSAGE
+    # =========================================================
+
+    async def update_cancelled_trade_message(
+        self,
+        proposal,
+    ):
+        channel_id = proposal[
+            "discord_channel_id"
+        ]
+
+        message_id = proposal[
+            "discord_message_id"
+        ]
+
+        if (
+            not channel_id
+            or not message_id
+        ):
+            return False
+
+        try:
+            channel = self.bot.get_channel(
+                channel_id
+            )
+
+            if channel is None:
+                channel = (
+                    await self.bot.fetch_channel(
+                        channel_id
+                    )
+                )
+
+            message = (
+                await channel.fetch_message(
+                    message_id
+                )
+            )
+
+            give_owner = get_pick_owner(
+                proposal["pick_a"]
+            )
+
+            receive_owner = get_pick_owner(
+                proposal["pick_b"]
+            )
+
+            embed = discord.Embed(
+                title=(
+                    "🚫 Draft Pick Trade Cancelled"
+                ),
+                description=(
+                    f"**{proposal['proposer_team_name']}** "
+                    "cancelled this trade proposal."
+                ),
+            )
+
+            if give_owner is not None:
+                embed.add_field(
+                    name=(
+                        f"{proposal['proposer_team_name']} "
+                        "Would Have Given"
+                    ),
+                    value=(
+                        f"**Round "
+                        f"{give_owner['round_number']} "
+                        f"• Pick "
+                        f"{give_owner['pick_in_round']} "
+                        f"• Overall "
+                        f"{proposal['pick_a']}**"
+                    ),
+                    inline=False,
+                )
+
+            else:
+                embed.add_field(
+                    name=(
+                        f"{proposal['proposer_team_name']} "
+                        "Would Have Given"
+                    ),
+                    value=(
+                        f"**Overall "
+                        f"{proposal['pick_a']}**"
+                    ),
+                    inline=False,
+                )
+
+            if receive_owner is not None:
+                embed.add_field(
+                    name=(
+                        f"{proposal['recipient_team_name']} "
+                        "Would Have Given"
+                    ),
+                    value=(
+                        f"**Round "
+                        f"{receive_owner['round_number']} "
+                        f"• Pick "
+                        f"{receive_owner['pick_in_round']} "
+                        f"• Overall "
+                        f"{proposal['pick_b']}**"
+                    ),
+                    inline=False,
+                )
+
+            else:
+                embed.add_field(
+                    name=(
+                        f"{proposal['recipient_team_name']} "
+                        "Would Have Given"
+                    ),
+                    value=(
+                        f"**Overall "
+                        f"{proposal['pick_b']}**"
+                    ),
+                    inline=False,
+                )
+
+            embed.add_field(
+                name="Status",
+                value="🚫 **CANCELLED**",
+                inline=False,
+            )
+
+            embed.set_footer(
+                text=(
+                    f"Trade Proposal "
+                    f"#{proposal['id']}"
+                )
+            )
+
+            disabled_view = TradeProposalView(
+                draft_cog=self,
+                proposal_id=(
+                    proposal["id"]
+                ),
+                recipient_user_id=(
+                    proposal[
+                        "recipient_discord_user_id"
+                    ]
+                ),
+            )
+
+            disabled_view.disable_all_buttons()
+
+            await message.edit(
+                content=None,
+                embed=embed,
+                view=disabled_view,
+            )
+
+            return True
+
+        except discord.NotFound:
+            print(
+                (
+                    "Cancelled trade proposal "
+                    f"message #{proposal['id']} "
+                    "no longer exists."
+                )
+            )
+
+            return False
+
+        except Exception as error:
+            print(
+                (
+                    "Cancelled Trade Message "
+                    f"Update Error: {error}"
+                )
+            )
+
+            return False
+
+    # =========================================================
     # CANCEL TRADE
     # =========================================================
 
@@ -3356,6 +3959,23 @@ class DraftCog(commands.Cog):
                 )
             )
 
+            message_updated = (
+                await self.update_cancelled_trade_message(
+                    cancelled
+                )
+            )
+
+            message_note = (
+                "The original trade proposal "
+                "message was updated."
+                if message_updated
+                else (
+                    "The trade was cancelled, but "
+                    "the original Discord message "
+                    "could not be updated."
+                )
+            )
+
             await interaction.followup.send(
                 (
                     f"✅ Trade Proposal "
@@ -3364,7 +3984,8 @@ class DraftCog(commands.Cog):
                     f"offered Overall "
                     f"**{cancelled['pick_a']}** for "
                     f"**{cancelled['recipient_team_name']}**'s "
-                    f"Overall **{cancelled['pick_b']}**."
+                    f"Overall **{cancelled['pick_b']}**.\n\n"
+                    f"{message_note}"
                 ),
                 ephemeral=True,
             )
@@ -4173,20 +4794,30 @@ class DraftCog(commands.Cog):
                 get_current_draft_team()
             )
 
-            if current is None:
-                await interaction.followup.send(
-                    (
-                        "❌ There is no active "
-                        "draft pick."
-                    ),
-                    ephemeral=True,
-                )
-                return
+            target_overall_pick = None
+            catch_up_pick = None
 
-            if not self.has_draft_admin_role(
+            if self.has_draft_admin_role(
                 interaction
             ):
+                if current is None:
+                    await interaction.followup.send(
+                        (
+                            "❌ There is no scheduled "
+                            "draft pick currently on the clock. "
+                            "Any remaining selections are "
+                            "catch-up picks and must be made "
+                            "by the team owner."
+                        ),
+                        ephemeral=True,
+                    )
+                    return
 
+                target_overall_pick = (
+                    current["overall_pick"]
+                )
+
+            else:
                 claim = (
                     get_team_claim_by_user(
                         interaction.user.id
@@ -4205,32 +4836,60 @@ class DraftCog(commands.Cog):
                     )
                     return
 
-                current_team_id = (
-                    current[
-                        "team"
-                    ][
-                        "espn_team_id"
-                    ]
+                # Catch-up picks always take priority for the
+                # team's owner. This keeps overdue selections
+                # oldest-first even if the team's next scheduled
+                # pick has already come back around.
+                catch_up_pick = (
+                    get_oldest_expired_pick_for_team(
+                        claim["espn_team_id"]
+                    )
                 )
 
-                if (
-                    claim[
-                        "espn_team_id"
-                    ]
-                    != current_team_id
-                ):
-                    await interaction.followup.send(
-                        (
-                            "❌ It is not your turn "
-                            "to pick.\n\n"
-                            f"**"
-                            f"{current['team']['team_name']}"
-                            f"** is currently "
-                            "on the clock."
-                        ),
-                        ephemeral=True,
+                if catch_up_pick is not None:
+                    target_overall_pick = (
+                        catch_up_pick[
+                            "overall_pick"
+                        ]
                     )
-                    return
+
+                else:
+                    if current is None:
+                        await interaction.followup.send(
+                            (
+                                "❌ There is no scheduled pick "
+                                "currently on the clock, and "
+                                "your team does not have an "
+                                "outstanding catch-up pick."
+                            ),
+                            ephemeral=True,
+                        )
+                        return
+
+                    current_team_id = (
+                        current["team"][
+                            "espn_team_id"
+                        ]
+                    )
+
+                    if (
+                        claim["espn_team_id"]
+                        != current_team_id
+                    ):
+                        await interaction.followup.send(
+                            (
+                                "❌ It is not your turn "
+                                "to pick.\n\n"
+                                f"**{current['team']['team_name']}** "
+                                "is currently on the clock."
+                            ),
+                            ephemeral=True,
+                        )
+                        return
+
+                    target_overall_pick = (
+                        current["overall_pick"]
+                    )
 
             try:
                 player_id = int(
@@ -4315,6 +4974,9 @@ class DraftCog(commands.Cog):
                     discord_user_id=(
                         interaction.user.id
                     ),
+                    target_overall_pick=(
+                        target_overall_pick
+                    ),
                 )
             )
 
@@ -4325,7 +4987,11 @@ class DraftCog(commands.Cog):
             )
 
             embed = discord.Embed(
-                title="🏈 Draft Pick",
+                title=(
+                    "⌛ Catch-Up Draft Pick"
+                    if saved_pick.get("catch_up")
+                    else "🏈 Draft Pick"
+                ),
                 description=(
                     f"**Round "
                     f"{saved_pick['round_number']} "
@@ -4357,6 +5023,17 @@ class DraftCog(commands.Cog):
                 inline=False,
             )
 
+            if saved_pick.get("catch_up"):
+                embed.add_field(
+                    name="⌛ Catch-Up Pick",
+                    value=(
+                        "This fills the team's oldest "
+                        "expired draft pick. The active "
+                        "draft clock was not changed."
+                    ),
+                    inline=False,
+                )
+
             new_state = (
                 get_draft_state()
             )
@@ -4378,36 +5055,52 @@ class DraftCog(commands.Cog):
                     get_current_draft_team()
                 )
 
-                next_marker = (
-                    " 🔄"
-                    if next_pick[
-                        "traded"
-                    ]
-                    else ""
-                )
+                if next_pick is not None:
+                    next_marker = (
+                        " 🔄"
+                        if next_pick[
+                            "traded"
+                        ]
+                        else ""
+                    )
 
-                embed.add_field(
-                    name="⏰ On the Clock",
-                    value=(
-                        f"**"
-                        f"{next_pick['team']['team_name']}"
-                        f"{next_marker}"
-                        f"**\n"
-                        f"Round "
-                        f"{next_pick['round_number']} "
-                        f"• Pick "
-                        f"{next_pick['pick_in_round']} "
-                        f"• Overall "
-                        f"{next_pick['overall_pick']}"
-                    ),
-                    inline=False,
-                )
+                    embed.add_field(
+                        name="⏰ On the Clock",
+                        value=(
+                            f"**"
+                            f"{next_pick['team']['team_name']}"
+                            f"{next_marker}"
+                            f"**\n"
+                            f"Round "
+                            f"{next_pick['round_number']} "
+                            f"• Pick "
+                            f"{next_pick['pick_in_round']} "
+                            f"• Overall "
+                            f"{next_pick['overall_pick']}"
+                        ),
+                        inline=False,
+                    )
+
+                else:
+                    embed.add_field(
+                        name="⌛ Catch-Up Picks Remaining",
+                        value=(
+                            "All scheduled draft clocks have "
+                            "finished. The draft will complete "
+                            "after all outstanding catch-up "
+                            "picks are made."
+                        ),
+                        inline=False,
+                    )
 
             await interaction.followup.send(
                 embed=embed
             )
 
             await self.refresh_draftboard()
+
+            if not saved_pick.get("catch_up"):
+                await self.process_draft_clock()
 
         except Exception as error:
             print(
@@ -4621,6 +5314,10 @@ class DraftCog(commands.Cog):
                 if row["traded"]
             )
 
+            catch_up_count = (
+                get_outstanding_expired_pick_count()
+            )
+
             embed = discord.Embed(
                 title=(
                     "🏈 Flint Michigan Megabowl "
@@ -4652,6 +5349,14 @@ class DraftCog(commands.Cog):
                 name="Traded Picks",
                 value=str(
                     traded_pick_count
+                ),
+                inline=True,
+            )
+
+            embed.add_field(
+                name="Catch-Up Picks Owed",
+                value=str(
+                    catch_up_count
                 ),
                 inline=True,
             )
@@ -4696,6 +5401,22 @@ class DraftCog(commands.Cog):
                         ),
                         inline=False,
                     )
+
+                    current_clock = (
+                        get_current_pick_clock()
+                    )
+                    deadline = self.format_clock_deadline(
+                        current_clock
+                    )
+
+                    if deadline:
+                        embed.add_field(
+                            name="Draft Clock",
+                            value=(
+                                f"Expires {deadline}"
+                            ),
+                            inline=False,
+                        )
 
             else:
 

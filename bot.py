@@ -26,6 +26,7 @@ class MegabowlBot(commands.Bot):
         await self.load_extension("cogs.draft")
         await self.load_extension("cogs.member_management")
         await self.load_extension("cogs.feature_request")
+        await self.load_extension("cogs.bug_reports")
 
         await self.tree.sync()
 
